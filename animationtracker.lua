@@ -1,18 +1,14 @@
 --[[
-AnimationTracker V2 for Matcha
+AnimationTracker V2.1 for Matcha
 - No startup HTTP requests.
-- Exports _G.AnimationTracker immediately.
-- Uses memory_read only.
-- Fast path uses the last known AnimationTrack layout.
-- If Roblox shifts the Animator active-animation-list offset, it discovers it
-  from the live Animator object instead of waiting on an offsets website.
-- If the Animation / AnimationId pair shifts, it performs a bounded scan and
-  caches the discovered layout for the rest of the session.
+- Uses the currently validated Roblox AnimationTrack layout directly.
+- Avoids the V2.0 false-positive self-calibration that selected 0xA0/0xB0.
+- Exports AnimationTracker immediately.
 ]]
 
-local VERSION = "2.0-self-healing"
+local VERSION = "2.1-fixed-layout"
 
-local DEFAULTS = {
+local OFF = {
     ActiveAnimations = 0x868,
     NodeTrack = 0x10,
     Animation = 0xD0,
@@ -21,18 +17,11 @@ local DEFAULTS = {
     TimePosition = 0xE8,
 }
 
-local Layout = {
-    ActiveAnimations = DEFAULTS.ActiveAnimations,
-    NodeTrack = DEFAULTS.NodeTrack,
-    Animation = DEFAULTS.Animation,
-    AnimationId = DEFAULTS.AnimationId,
-    Speed = DEFAULTS.Speed,
-    TimePosition = DEFAULTS.TimePosition,
-    Calibrated = false,
-}
-
 local function finite(n)
-    return type(n) == "number" and n == n and n > -math.huge and n < math.huge
+    return type(n) == "number"
+        and n == n
+        and n > -math.huge
+        and n < math.huge
 end
 
 local function readPtr(address)
@@ -58,25 +47,20 @@ end
 
 local function normalizeAssetId(value)
     if type(value) ~= "string" then return nil end
-
     local digits = string.match(value, "(%d%d%d%d%d%d+)")
-    if not digits then return nil end
-
-    -- Roblox asset IDs are far smaller than this; reject obviously bogus
-    -- strings produced by scanning unrelated memory.
-    if #digits > 20 then return nil end
-
+    if not digits or #digits > 20 then return nil end
     return "rbxassetid://" .. digits, tonumber(digits)
 end
 
 local function getAnimatorAddress(character)
-    if not character or character.Address == 0 then return nil end
+    if not character or not character.Address or character.Address == 0 then
+        return nil
+    end
 
     local humanoid = character:FindFirstChildOfClass("Humanoid")
     if not humanoid then return nil end
 
     local animator = humanoid:FindFirstChildOfClass("Animator")
-
     if not animator or not animator.Address or animator.Address == 0 then
         return nil
     end
@@ -84,197 +68,59 @@ local function getAnimatorAddress(character)
     return animator.Address
 end
 
-local function getFirstTrackForActiveOffset(animatorAddress, activeOffset)
-    local head = readPtr(animatorAddress + activeOffset)
-    if head == 0 then return nil end
-
-    local firstNode = readPtr(head)
-    if firstNode == 0 or firstNode == head then return nil end
-
-    local track = readPtr(firstNode + DEFAULTS.NodeTrack)
-    if track == 0 then return nil end
-
-    return track, head, firstNode
-end
-
-local function readAssetWithLayout(trackAddress, animationOffset, animationIdOffset)
-    local animation = readPtr(trackAddress + animationOffset)
-    if animation == 0 then return nil end
-
-    local idPointer = readPtr(animation + animationIdOffset)
-    if idPointer == 0 then return nil end
-
-    local text = readString(idPointer)
-    if not text then return nil end
-
-    return normalizeAssetId(text)
-end
-
-local function findAnimationLayout(trackAddress)
-    -- Fast path: layout used by the previous tracker.
-    local assetId = readAssetWithLayout(
-        trackAddress,
-        DEFAULTS.Animation,
-        DEFAULTS.AnimationId
-    )
-
-    if assetId then
-        return DEFAULTS.Animation, DEFAULTS.AnimationId
-    end
-
-    -- Most Roblox layout shifts keep these fields in the same small region.
-    -- Keep the scan bounded so calibration cannot create a long freeze.
-    for animationOffset = 0xA0, 0x110, 0x8 do
-        local animation = readPtr(trackAddress + animationOffset)
-        if animation ~= 0 then
-            for animationIdOffset = 0xA0, 0x110, 0x8 do
-                local idPointer = readPtr(animation + animationIdOffset)
-                if idPointer ~= 0 then
-                    local text = readString(idPointer)
-                    if text and normalizeAssetId(text) then
-                        return animationOffset, animationIdOffset
-                    end
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
-local function findActiveAnimationsOffset(animatorAddress)
-    -- Try the historical value first.
-    local track = getFirstTrackForActiveOffset(
-        animatorAddress,
-        DEFAULTS.ActiveAnimations
-    )
-
-    if track then
-        local animOff, idOff = findAnimationLayout(track)
-        if animOff then
-            return DEFAULTS.ActiveAnimations, animOff, idOff
-        end
-    end
-
-    -- Animator.ActiveAnimations has historically lived in this region.
-    -- Scan pointer-aligned offsets only and validate through a real
-    -- AnimationId before accepting a candidate.
-    for activeOffset = 0x700, 0xA80, 0x8 do
-        if activeOffset ~= DEFAULTS.ActiveAnimations then
-            local candidateTrack = getFirstTrackForActiveOffset(
-                animatorAddress,
-                activeOffset
-            )
-
-            if candidateTrack then
-                local animOff, idOff = findAnimationLayout(candidateTrack)
-                if animOff then
-                    return activeOffset, animOff, idOff
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
-local function calibrate(character)
-    local animatorAddress = getAnimatorAddress(character)
-    if not animatorAddress then return false end
-
-    local activeOffset, animationOffset, animationIdOffset =
-        findActiveAnimationsOffset(animatorAddress)
-
-    if not activeOffset then return false end
-
-    Layout.ActiveAnimations = activeOffset
-    Layout.Animation = animationOffset
-    Layout.AnimationId = animationIdOffset
-
-    -- In the known AnimationTrack layout Speed/TimePosition sit immediately
-    -- after the Animation pointer. Preserve that relationship when the
-    -- Animation field shifts as a block.
-    Layout.Speed = animationOffset + 0x14
-    Layout.TimePosition = animationOffset + 0x18
-    Layout.Calibrated = true
-
-    print(string.format(
-        "[AnimationTracker V2] calibrated | Active=0x%X Animation=0x%X AnimationId=0x%X Time=0x%X",
-        Layout.ActiveAnimations,
-        Layout.Animation,
-        Layout.AnimationId,
-        Layout.TimePosition
-    ))
-
-    return true
-end
-
 local function getPlayingTrackAddresses(character)
     local animatorAddress = getAnimatorAddress(character)
     if not animatorAddress then return {} end
 
-    local function readList()
-        local listHead = readPtr(animatorAddress + Layout.ActiveAnimations)
-        if listHead == 0 then return nil end
+    local listHead = readPtr(animatorAddress + OFF.ActiveAnimations)
+    if listHead == 0 then return {} end
 
-        local firstNode = readPtr(listHead)
-        if firstNode == 0 then return nil end
-        if firstNode == listHead then return {} end
+    local firstNode = readPtr(listHead)
+    if firstNode == 0 or firstNode == listHead then return {} end
 
-        local tracks = {}
-        local currentNode = firstNode
-        local visited = {}
+    local tracks = {}
+    local visited = {}
+    local currentNode = firstNode
 
-        while currentNode ~= 0
-            and currentNode ~= listHead
-            and not visited[currentNode]
-            and #tracks < 50 do
+    while currentNode ~= 0
+        and currentNode ~= listHead
+        and not visited[currentNode]
+        and #tracks < 50 do
 
-            visited[currentNode] = true
+        visited[currentNode] = true
 
-            local track = readPtr(currentNode + Layout.NodeTrack)
-            if track ~= 0 then
-                tracks[#tracks + 1] = track
-            end
-
-            local nextNode = readPtr(currentNode)
-            if nextNode == 0 or nextNode == listHead then break end
-            currentNode = nextNode
+        local trackAddress = readPtr(currentNode + OFF.NodeTrack)
+        if trackAddress ~= 0 then
+            tracks[#tracks + 1] = trackAddress
         end
 
-        return tracks
+        local nextNode = readPtr(currentNode)
+        if nextNode == 0 or nextNode == listHead then break end
+        currentNode = nextNode
     end
 
-    local tracks = readList()
-
-    if tracks == nil or (#tracks > 0 and not Layout.Calibrated) then
-        if calibrate(character) then
-            tracks = readList()
-        end
-    end
-
-    return tracks or {}
+    return tracks
 end
 
 local function extractTrackInfo(trackAddress)
     if not trackAddress or trackAddress == 0 then return nil end
 
-    local animation = readPtr(trackAddress + Layout.Animation)
+    local animation = readPtr(trackAddress + OFF.Animation)
     if animation == 0 then return nil end
 
-    local idPointer = readPtr(animation + Layout.AnimationId)
+    local idPointer = readPtr(animation + OFF.AnimationId)
     if idPointer == 0 then return nil end
 
     local rawId = readString(idPointer)
     local animationId, numericId = normalizeAssetId(rawId)
     if not animationId then return nil end
 
-    local timePosition = readFloat(trackAddress + Layout.TimePosition)
+    local timePosition = readFloat(trackAddress + OFF.TimePosition)
     if not timePosition or timePosition < -0.25 or timePosition > 120 then
         timePosition = 0
     end
 
-    local speed = readFloat(trackAddress + Layout.Speed)
+    local speed = readFloat(trackAddress + OFF.Speed)
     if not speed or speed < -16 or speed > 16 then
         speed = 1
     end
@@ -294,7 +140,7 @@ local Signal = {}
 Signal.__index = Signal
 
 function Signal.new()
-    return setmetatable({ _listeners = {} }, Signal)
+    return setmetatable({_listeners = {}}, Signal)
 end
 
 function Signal:Connect(callback)
@@ -318,10 +164,9 @@ end
 
 function Signal:Fire(...)
     for i = 1, #self._listeners do
-        local callback = self._listeners[i]
-        local ok, err = pcall(callback, ...)
+        local ok, err = pcall(self._listeners[i], ...)
         if not ok then
-            print("[AnimationTracker V2] listener error: " .. tostring(err))
+            print("[AnimationTracker V2.1] listener error: " .. tostring(err))
         end
     end
 end
@@ -332,15 +177,12 @@ AnimationTracker.Version = VERSION
 
 function AnimationTracker.new(ignoreIds)
     local self = setmetatable({}, AnimationTracker)
-
     self.AnimationAdded = Signal.new()
     self.AnimationUpdated = Signal.new()
     self.AnimationRemoved = Signal.new()
     self.IgnoreIds = ignoreIds or {}
     self._cachedTracks = {}
-    self._lastCalibrationAttempt = 0
-    self._warnedNoTracks = false
-
+    self._validatedLogged = false
     return self
 end
 
@@ -358,16 +200,6 @@ end
 
 function AnimationTracker:Update(character)
     local tracksPlaying = getPlayingTrackAddresses(character)
-
-    if #tracksPlaying == 0 and not Layout.Calibrated then
-        local now = os.clock()
-        if now - self._lastCalibrationAttempt >= 1 then
-            self._lastCalibrationAttempt = now
-            calibrate(character)
-        end
-        return {}
-    end
-
     local currentAddresses = {}
     local activeSnapshot = {}
 
@@ -380,17 +212,29 @@ function AnimationTracker:Update(character)
 
         if not info then
             info = extractTrackInfo(address)
+
             if info then
                 self._cachedTracks[address] = info
                 newlyExtracted = true
+
+                if not self._validatedLogged then
+                    self._validatedLogged = true
+                    print(string.format(
+                        "[AnimationTracker V2.1] layout validated | Active=0x%X Animation=0x%X AnimationId=0x%X Time=0x%X",
+                        OFF.ActiveAnimations,
+                        OFF.Animation,
+                        OFF.AnimationId,
+                        OFF.TimePosition
+                    ))
+                end
             end
         else
-            local liveTime = readFloat(address + Layout.TimePosition)
+            local liveTime = readFloat(address + OFF.TimePosition)
             if liveTime and liveTime >= -0.25 and liveTime <= 120 then
                 info.TimePosition = liveTime
             end
 
-            local liveSpeed = readFloat(address + Layout.Speed)
+            local liveSpeed = readFloat(address + OFF.Speed)
             if liveSpeed and liveSpeed >= -16 and liveSpeed <= 16 then
                 info.Speed = liveSpeed
             end
@@ -419,7 +263,6 @@ end
 local ENV = (getgenv and getgenv()) or _G
 ENV.AnimationTracker = AnimationTracker
 _G.AnimationTracker = AnimationTracker
-AnimationTracker = AnimationTracker
 
-print("[AnimationTracker V2] loaded " .. VERSION .. " | no startup HTTP")
+print("[AnimationTracker V2.1] loaded " .. VERSION .. " | no startup HTTP")
 return AnimationTracker
