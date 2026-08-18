@@ -1,21 +1,34 @@
 --[[
-AnimationTracker V2.2 Hybrid for Matcha
-- No startup HTTP requests.
-- Prefers Animator:GetPlayingAnimationTracks() when Matcha exposes it.
-- Falls back to the validated memory layout when native track enumeration is unavailable.
-- Uses FindFirstChildWhichIsA first, matching the original tracker.
-- Emits throttled diagnostics when Debug=true.
+AnimationTracker V2.3 Known-ID Calibrator for Matcha
+- No startup HTTP.
+- Read-only memory access.
+- Uses the legacy layout first.
+- If Roblox moved animation internals, it discovers the live layout while a
+  configured attack animation is playing.
+- Validation is strict: a candidate layout is accepted only when the decoded
+  animation ID is one of the attack IDs supplied by the main script.
 ]]
 
-local VERSION = "2.2-hybrid"
+local VERSION = "2.3-known-id-calibrator"
 
-local OFF = {
+local LEGACY = {
     ActiveAnimations = 0x868,
     NodeTrack = 0x10,
     Animation = 0xD0,
     AnimationId = 0xD0,
-    Speed = 0xE4,
-    TimePosition = 0xE8,
+    SpeedDelta = 0x14,
+    TimeDelta = 0x18,
+}
+
+local Layout = {
+    ActiveAnimations = LEGACY.ActiveAnimations,
+    NodeTrack = LEGACY.NodeTrack,
+    Animation = LEGACY.Animation,
+    AnimationId = LEGACY.AnimationId,
+    Speed = LEGACY.Animation + LEGACY.SpeedDelta,
+    TimePosition = LEGACY.Animation + LEGACY.TimeDelta,
+    Locked = false,
+    Source = "legacy",
 }
 
 local function finite(n)
@@ -25,30 +38,42 @@ local function finite(n)
         and n < math.huge
 end
 
+local function plausiblePtr(p)
+    return finite(p)
+        and p >= 0x10000
+        and p <= 0x7FFFFFFFFFFF
+end
+
 local function readPtr(address)
-    if not finite(address) or address <= 0 then return 0 end
+    if not plausiblePtr(address) then return 0 end
 
     local ok, value = pcall(function()
         return memory_read("uintptr_t", address)
     end)
 
-    if not ok or not finite(value) then return 0 end
+    if not ok or not plausiblePtr(value) then
+        return 0
+    end
+
     return value
 end
 
 local function readFloat(address)
-    if not finite(address) or address <= 0 then return nil end
+    if not plausiblePtr(address) then return nil end
 
     local ok, value = pcall(function()
         return memory_read("float", address)
     end)
 
-    if not ok or not finite(value) then return nil end
+    if not ok or not finite(value) then
+        return nil
+    end
+
     return value
 end
 
 local function readString(address)
-    if not finite(address) or address <= 0 then return nil end
+    if not plausiblePtr(address) then return nil end
 
     local ok, value = pcall(function()
         return memory_read("string", address)
@@ -75,7 +100,7 @@ end
 local function findHumanoid(character)
     if not character then return nil end
 
-    local humanoid = nil
+    local humanoid
 
     pcall(function()
         humanoid = character:FindFirstChildWhichIsA("Humanoid")
@@ -100,7 +125,7 @@ local function findAnimator(character)
     local humanoid = findHumanoid(character)
     if not humanoid then return nil end
 
-    local animator = nil
+    local animator
 
     pcall(function()
         animator = humanoid:FindFirstChildWhichIsA("Animator")
@@ -121,124 +146,35 @@ local function findAnimator(character)
     return animator
 end
 
-local function getAnimatorAddress(animator)
+local function getAnimatorAddress(character)
+    local animator = findAnimator(character)
     if not animator then return nil end
 
-    local address = nil
+    local address
+
     pcall(function()
         address = animator.Address
     end)
 
-    if not finite(address) or address == 0 then
+    if not plausiblePtr(address) then
         return nil
     end
 
     return address
 end
 
-local function extractNativeTrack(track)
-    if not track then return nil end
+local function getList(animatorAddress, activeOffset)
+    local head = readPtr(animatorAddress + activeOffset)
+    if head == 0 then return nil end
 
-    local rawAnimationId = nil
+    local firstNode = readPtr(head)
 
-    local okId = pcall(function()
-        local animation = track.Animation
-        if animation then
-            rawAnimationId = animation.AnimationId
-        end
-    end)
-
-    if not okId or not rawAnimationId then
-        return nil
-    end
-
-    local animationId, numericId = normalizeAssetId(rawAnimationId)
-    if not animationId then return nil end
-
-    local timePosition = 0
-    pcall(function()
-        local value = track.TimePosition
-        if finite(value) and value >= -0.25 and value <= 120 then
-            timePosition = value
-        end
-    end)
-
-    local speed = 1
-    pcall(function()
-        local value = track.Speed
-        if finite(value) and value >= -16 and value <= 16 then
-            speed = value
-        end
-    end)
-
-    local address = nil
-    pcall(function()
-        address = track.Address
-    end)
-
-    if not finite(address) or address == 0 then
-        address = nil
-    end
-
-    return {
-        Address = address,
-        NativeTrack = track,
-        Name = animationId,
-        AnimationId = animationId,
-        NumericAnimationId = numericId,
-        TimePosition = timePosition,
-        Speed = speed,
-        IsPlaying = 1,
-        Source = "native",
-    }
-end
-
-local function getNativeTrackInfos(character)
-    local animator = findAnimator(character)
-    if not animator then
-        return nil, "no_animator"
-    end
-
-    local tracks = nil
-
-    local ok = pcall(function()
-        tracks = animator:GetPlayingAnimationTracks()
-    end)
-
-    if not ok or type(tracks) ~= "table" then
-        return nil, "native_unavailable"
-    end
-
-    local infos = {}
-
-    for _, track in ipairs(tracks) do
-        local info = extractNativeTrack(track)
-        if info then
-            infos[#infos + 1] = info
-        end
-    end
-
-    return infos, "native"
-end
-
-local function getMemoryTrackAddresses(character)
-    local animator = findAnimator(character)
-    if not animator then return {}, "no_animator" end
-
-    local animatorAddress = getAnimatorAddress(animator)
-    if not animatorAddress then return {}, "no_animator_address" end
-
-    local listHead = readPtr(animatorAddress + OFF.ActiveAnimations)
-    if listHead == 0 then return {}, "no_list_head" end
-
-    local firstNode = readPtr(listHead)
-
-    if firstNode == 0 then
-        return {}, "no_first_node"
-    end
-
-    if firstNode == listHead then
-        return {}, "empty_list"
+    if firstNode == 0 or firstNode == head then
+        return {
+            Head = head,
+            First = firstNode,
+            Tracks = {},
+        }
     end
 
     local tracks = {}
@@ -246,13 +182,14 @@ local function getMemoryTrackAddresses(character)
     local currentNode = firstNode
 
     while currentNode ~= 0
-        and currentNode ~= listHead
+        and currentNode ~= head
         and not visited[currentNode]
         and #tracks < 50 do
 
         visited[currentNode] = true
 
-        local trackAddress = readPtr(currentNode + OFF.NodeTrack)
+        local trackAddress =
+            readPtr(currentNode + LEGACY.NodeTrack)
 
         if trackAddress ~= 0 then
             tracks[#tracks + 1] = trackAddress
@@ -260,39 +197,248 @@ local function getMemoryTrackAddresses(character)
 
         local nextNode = readPtr(currentNode)
 
-        if nextNode == 0 or nextNode == listHead then
+        if nextNode == 0 or nextNode == head then
             break
         end
 
         currentNode = nextNode
     end
 
-    return tracks, "memory"
+    return {
+        Head = head,
+        First = firstNode,
+        Tracks = tracks,
+    }
 end
 
-local function extractMemoryTrack(trackAddress)
-    if not finite(trackAddress) or trackAddress == 0 then return nil end
+local function readIdWithLayout(trackAddress, animationOffset, animationIdOffset)
+    local animation =
+        readPtr(trackAddress + animationOffset)
 
-    local animation = readPtr(trackAddress + OFF.Animation)
     if animation == 0 then return nil end
 
-    local idPointer = readPtr(animation + OFF.AnimationId)
+    local idPointer =
+        readPtr(animation + animationIdOffset)
+
     if idPointer == 0 then return nil end
 
-    local rawId = readString(idPointer)
-    local animationId, numericId = normalizeAssetId(rawId)
+    local raw = readString(idPointer)
+    if not raw then return nil end
+
+    local animationId, numericId =
+        normalizeAssetId(raw)
 
     if not animationId then return nil end
 
-    local timePosition = readFloat(trackAddress + OFF.TimePosition)
+    return animationId, numericId
+end
 
-    if not timePosition or timePosition < -0.25 or timePosition > 120 then
+local function idIsKnown(knownIds, numericId)
+    if not numericId or type(knownIds) ~= "table" then
+        return false
+    end
+
+    if knownIds[numericId] == true then
+        return true
+    end
+
+    for i = 1, #knownIds do
+        if tonumber(knownIds[i]) == numericId then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function tryLegacy(character, knownIds)
+    local animatorAddress =
+        getAnimatorAddress(character)
+
+    if not animatorAddress then
+        return false
+    end
+
+    local list =
+        getList(animatorAddress, LEGACY.ActiveAnimations)
+
+    if not list or #list.Tracks == 0 then
+        return false
+    end
+
+    for i = 1, #list.Tracks do
+        local animationId, numericId =
+            readIdWithLayout(
+                list.Tracks[i],
+                LEGACY.Animation,
+                LEGACY.AnimationId
+            )
+
+        if animationId and (
+            type(knownIds) ~= "table"
+            or next(knownIds) == nil
+            or idIsKnown(knownIds, numericId)
+        ) then
+            Layout.ActiveAnimations =
+                LEGACY.ActiveAnimations
+
+            Layout.Animation =
+                LEGACY.Animation
+
+            Layout.AnimationId =
+                LEGACY.AnimationId
+
+            Layout.Speed =
+                Layout.Animation + LEGACY.SpeedDelta
+
+            Layout.TimePosition =
+                Layout.Animation + LEGACY.TimeDelta
+
+            Layout.Locked = true
+            Layout.Source = "legacy-validated"
+
+            return true
+        end
+    end
+
+    return false
+end
+
+local function calibrateFromKnownAttack(character, knownIds)
+    if type(knownIds) ~= "table"
+        or next(knownIds) == nil then
+        return false
+    end
+
+    local animatorAddress =
+        getAnimatorAddress(character)
+
+    if not animatorAddress then
+        return false
+    end
+
+    for activeOffset = 0x700, 0xB80, 0x8 do
+        local list =
+            getList(animatorAddress, activeOffset)
+
+        if list and #list.Tracks > 0 then
+            local maxTracks =
+                math.min(#list.Tracks, 6)
+
+            for trackIndex = 1, maxTracks do
+                local trackAddress =
+                    list.Tracks[trackIndex]
+
+                for animationOffset = 0x80, 0x160, 0x8 do
+                    local animation =
+                        readPtr(trackAddress + animationOffset)
+
+                    if animation ~= 0 then
+                        for animationIdOffset = 0x80, 0x160, 0x8 do
+                            local idPointer =
+                                readPtr(animation + animationIdOffset)
+
+                            if idPointer ~= 0 then
+                                local raw =
+                                    readString(idPointer)
+
+                                if raw then
+                                    local animationId, numericId =
+                                        normalizeAssetId(raw)
+
+                                    if animationId
+                                        and idIsKnown(knownIds, numericId) then
+
+                                        Layout.ActiveAnimations =
+                                            activeOffset
+
+                                        Layout.Animation =
+                                            animationOffset
+
+                                        Layout.AnimationId =
+                                            animationIdOffset
+
+                                        Layout.Speed =
+                                            animationOffset + LEGACY.SpeedDelta
+
+                                        Layout.TimePosition =
+                                            animationOffset + LEGACY.TimeDelta
+
+                                        Layout.Locked = true
+                                        Layout.Source = "known-id-calibrated"
+
+                                        print(string.format(
+                                            "[AnimationTracker V2.3] CALIBRATED from attack %s | Active=0x%X Animation=0x%X AnimationId=0x%X Speed=0x%X Time=0x%X",
+                                            tostring(animationId),
+                                            Layout.ActiveAnimations,
+                                            Layout.Animation,
+                                            Layout.AnimationId,
+                                            Layout.Speed,
+                                            Layout.TimePosition
+                                        ))
+
+                                        return true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+local function getTracksWithLayout(character)
+    local animatorAddress =
+        getAnimatorAddress(character)
+
+    if not animatorAddress then
+        return {}
+    end
+
+    local list =
+        getList(
+            animatorAddress,
+            Layout.ActiveAnimations
+        )
+
+    return list and list.Tracks or {}
+end
+
+local function extractTrackInfo(trackAddress)
+    local animationId, numericId =
+        readIdWithLayout(
+            trackAddress,
+            Layout.Animation,
+            Layout.AnimationId
+        )
+
+    if not animationId then
+        return nil
+    end
+
+    local timePosition =
+        readFloat(
+            trackAddress + Layout.TimePosition
+        )
+
+    if not timePosition
+        or timePosition < -0.25
+        or timePosition > 5 then
         timePosition = 0
     end
 
-    local speed = readFloat(trackAddress + OFF.Speed)
+    local speed =
+        readFloat(
+            trackAddress + Layout.Speed
+        )
 
-    if not speed or speed < -16 or speed > 16 then
+    if not speed
+        or speed < -16
+        or speed > 16 then
         speed = 1
     end
 
@@ -304,7 +450,7 @@ local function extractMemoryTrack(trackAddress)
         TimePosition = timePosition,
         Speed = speed,
         IsPlaying = 1,
-        Source = "memory",
+        Source = Layout.Source,
     }
 end
 
@@ -312,11 +458,14 @@ local Signal = {}
 Signal.__index = Signal
 
 function Signal.new()
-    return setmetatable({_listeners = {}}, Signal)
+    return setmetatable({
+        _listeners = {}
+    }, Signal)
 end
 
 function Signal:Connect(callback)
-    self._listeners[#self._listeners + 1] = callback
+    self._listeners[#self._listeners + 1] =
+        callback
 
     local connected = true
 
@@ -337,10 +486,14 @@ end
 
 function Signal:Fire(...)
     for i = 1, #self._listeners do
-        local ok, err = pcall(self._listeners[i], ...)
+        local ok, err =
+            pcall(self._listeners[i], ...)
 
         if not ok then
-            print("[AnimationTracker V2.2] listener error: " .. tostring(err))
+            print(
+                "[AnimationTracker V2.3] listener error: "
+                .. tostring(err)
+            )
         end
     end
 end
@@ -350,18 +503,29 @@ AnimationTracker.__index = AnimationTracker
 AnimationTracker.Version = VERSION
 
 function AnimationTracker.new(ignoreIds)
-    local self = setmetatable({}, AnimationTracker)
+    local self =
+        setmetatable({}, AnimationTracker)
 
-    self.AnimationAdded = Signal.new()
-    self.AnimationUpdated = Signal.new()
-    self.AnimationRemoved = Signal.new()
+    self.AnimationAdded =
+        Signal.new()
 
-    self.IgnoreIds = ignoreIds or {}
+    self.AnimationUpdated =
+        Signal.new()
+
+    self.AnimationRemoved =
+        Signal.new()
+
+    self.IgnoreIds =
+        ignoreIds or {}
+
+    self.KnownIds = {}
+
     self.Debug = false
 
     self._cachedTracks = {}
-    self._lastDiagAt = {}
-    self._lastDiagText = {}
+    self._lastDiag = 0
+    self._lastCalibrateAttempt = 0
+    self._legacyTried = false
 
     return self
 end
@@ -378,113 +542,144 @@ local function ignored(ignoreIds, numericId)
     return false
 end
 
-local function characterName(character)
-    local name = "?"
+local function charName(character)
+    local value = "?"
 
     pcall(function()
-        name = character.Name
+        value = character.Name
     end)
 
-    return tostring(name or "?")
+    return tostring(value or "?")
 end
 
 function AnimationTracker:_diag(character, text)
     if not self.Debug then return end
 
-    local key = characterName(character)
     local now = os.clock()
 
-    if self._lastDiagText[key] == text
-        and (now - (self._lastDiagAt[key] or 0)) < 2 then
+    if now - self._lastDiag < 2 then
         return
     end
 
-    self._lastDiagText[key] = text
-    self._lastDiagAt[key] = now
+    self._lastDiag = now
 
-    print("[AnimationTracker V2.2] " .. key .. " | " .. text)
-end
-
-local function makeCacheKey(info)
-    if info.Address then
-        return info.Address
-    end
-
-    if info.NativeTrack then
-        return info.NativeTrack
-    end
-
-    return info
+    print(
+        "[AnimationTracker V2.3] "
+        .. charName(character)
+        .. " | "
+        .. tostring(text)
+    )
 end
 
 function AnimationTracker:Update(character)
-    local currentInfos = nil
-    local source = nil
+    if not Layout.Locked and not self._legacyTried then
+        self._legacyTried = true
 
-    local nativeInfos, nativeReason = getNativeTrackInfos(character)
-
-    if nativeInfos and #nativeInfos > 0 then
-        currentInfos = nativeInfos
-        source = "native"
-    else
-        local addresses, memoryReason = getMemoryTrackAddresses(character)
-        local memoryInfos = {}
-
-        for i = 1, #addresses do
-            local info = extractMemoryTrack(addresses[i])
-
-            if info then
-                memoryInfos[#memoryInfos + 1] = info
-            end
-        end
-
-        currentInfos = memoryInfos
-        source = "memory"
-
-        if #currentInfos == 0 then
-            self:_diag(
-                character,
-                string.format(
-                    "tracks=0 | native=%s | memory=%s | animator=%s",
-                    tostring(nativeReason),
-                    tostring(memoryReason),
-                    findAnimator(character) and "YES" or "NO"
-                )
+        if tryLegacy(character, self.KnownIds) then
+            print(
+                "[AnimationTracker V2.3] legacy layout validated"
             )
         end
+    end
+
+    local trackAddresses =
+        getTracksWithLayout(character)
+
+    if #trackAddresses == 0
+        and not Layout.Locked then
+
+        local now = os.clock()
+
+        if now - self._lastCalibrateAttempt >= 0.10 then
+            self._lastCalibrateAttempt = now
+
+            calibrateFromKnownAttack(
+                character,
+                self.KnownIds
+            )
+
+            if Layout.Locked then
+                trackAddresses =
+                    getTracksWithLayout(character)
+            end
+        end
+    end
+
+    if #trackAddresses == 0 then
+        self:_diag(
+            character,
+            string.format(
+                "tracks=0 | locked=%s | layout=%s | waiting for configured attack to calibrate",
+                tostring(Layout.Locked),
+                tostring(Layout.Source)
+            )
+        )
+
+        for key, cachedInfo in pairs(self._cachedTracks) do
+            self.AnimationRemoved:Fire(cachedInfo)
+            self._cachedTracks[key] = nil
+        end
+
+        return {}
     end
 
     local currentKeys = {}
     local activeSnapshot = {}
 
-    for i = 1, #currentInfos do
-        local liveInfo = currentInfos[i]
-        local key = makeCacheKey(liveInfo)
+    for i = 1, #trackAddresses do
+        local address =
+            trackAddresses[i]
 
-        currentKeys[key] = true
+        local info =
+            extractTrackInfo(address)
 
-        local cached = self._cachedTracks[key]
-        local newlyExtracted = cached == nil
+        if info then
+            local key = address
+            currentKeys[key] = true
 
-        if not cached then
-            cached = liveInfo
-            self._cachedTracks[key] = cached
-        else
-            cached.AnimationId = liveInfo.AnimationId
-            cached.NumericAnimationId = liveInfo.NumericAnimationId
-            cached.TimePosition = liveInfo.TimePosition
-            cached.Speed = liveInfo.Speed
-            cached.Source = liveInfo.Source
-            cached.NativeTrack = liveInfo.NativeTrack or cached.NativeTrack
-        end
+            local cached =
+                self._cachedTracks[key]
 
-        if not ignored(self.IgnoreIds, cached.NumericAnimationId) then
-            if newlyExtracted then
-                self.AnimationAdded:Fire(cached)
+            local newlyExtracted =
+                cached == nil
+
+            if not cached then
+                cached = info
+                self._cachedTracks[key] = cached
+            else
+                cached.AnimationId =
+                    info.AnimationId
+
+                cached.NumericAnimationId =
+                    info.NumericAnimationId
+
+                cached.TimePosition =
+                    info.TimePosition
+
+                cached.Speed =
+                    info.Speed
+
+                cached.Source =
+                    info.Source
             end
 
-            self.AnimationUpdated:Fire(cached, cached.TimePosition)
-            activeSnapshot[#activeSnapshot + 1] = cached
+            if not ignored(
+                self.IgnoreIds,
+                cached.NumericAnimationId
+            ) then
+
+                if newlyExtracted then
+                    self.AnimationAdded:Fire(cached)
+                end
+
+                self.AnimationUpdated:Fire(
+                    cached,
+                    cached.TimePosition
+                )
+
+                activeSnapshot[#activeSnapshot + 1] =
+                    cached
+            end
         end
     end
 
@@ -499,10 +694,10 @@ function AnimationTracker:Update(character)
         self:_diag(
             character,
             string.format(
-                "source=%s | active=%d | first=%s",
-                tostring(source),
+                "active=%d | first=%s | source=%s",
                 #activeSnapshot,
-                tostring(activeSnapshot[1].AnimationId)
+                tostring(activeSnapshot[1].AnimationId),
+                tostring(Layout.Source)
             )
         )
     end
@@ -510,10 +705,16 @@ function AnimationTracker:Update(character)
     return activeSnapshot
 end
 
-local ENV = (getgenv and getgenv()) or _G
+local ENV =
+    (getgenv and getgenv()) or _G
 
 ENV.AnimationTracker = AnimationTracker
 _G.AnimationTracker = AnimationTracker
 
-print("[AnimationTracker V2.2] loaded " .. VERSION .. " | native + memory fallback")
+print(
+    "[AnimationTracker V2.3] loaded "
+    .. VERSION
+    .. " | strict known-ID calibration"
+)
+
 return AnimationTracker
