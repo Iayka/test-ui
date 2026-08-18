@@ -14,7 +14,7 @@ local Mouse = LocalPlayer:GetMouse()
 
 local Library = {}
 Library.__index = Library
-Library.Version = "Matcha-INS-Compat-1.0"
+Library.Version = "Matcha-INS-Compat-1.2"
 
 local C = {
     BG = Color3.fromRGB(8, 8, 10),
@@ -87,6 +87,28 @@ local function setText(obj, text)
     if obj then
         pcall(function() obj.Text = tostring(text or "") end)
     end
+end
+
+-- Drawing.Text has no reliable clipping region in Matcha.
+-- Keep every rendered string inside its allotted pixel width instead.
+local function fitText(text, pixelWidth, fontSize)
+    text = tostring(text or "")
+    pixelWidth = math.max(8, tonumber(pixelWidth) or 8)
+    fontSize = tonumber(fontSize) or 12
+
+    -- Conservative average width so text never bleeds outside its panel.
+    local approxCharWidth = math.max(5.5, fontSize * 0.62)
+    local maxChars = math.max(1, math.floor(pixelWidth / approxCharWidth))
+
+    if #text <= maxChars then
+        return text
+    end
+
+    if maxChars <= 3 then
+        return string.sub(text, 1, maxChars)
+    end
+
+    return string.sub(text, 1, maxChars - 3) .. "..."
 end
 
 local function setPos(obj, x, y)
@@ -167,6 +189,12 @@ end
 local ControlMethods = {}
 
 function ControlMethods:Get()
+    if self.Keybind
+        and string.lower(tostring(self.Keybind.Mode or "")) == "hold"
+        and self.Keybind.Held == true then
+        return true
+    end
+
     return self.Value
 end
 
@@ -380,7 +408,7 @@ function Library:CreateWindow(opts)
     w.Draw.Header = makeSquare(w.Objects, w.X, w.Y, w.Width, 38, C.PANEL, true, 3)
     w.Draw.RedLine = makeSquare(w.Objects, w.X, w.Y + 37, w.Width, 1, C.RED, true, 5)
     w.Draw.Title = makeText(w.Objects, w.Title, 14, w.X + 12, w.Y + 12, C.TEXT, 7)
-    w.Draw.Version = makeText(w.Objects, "INS Compat / Matcha Drawing", 11, w.X + 300, w.Y + 13, C.MUTED, 7)
+    w.Draw.Version = makeText(w.Objects, "INS UI v1.2", 11, w.X + 300, w.Y + 13, C.MUTED, 7)
     w.Draw.Close = makeSquare(w.Objects, w.X + w.Width - 30, w.Y + 8, 20, 20, C.RED_DARK, true, 6)
     w.Draw.CloseText = makeText(w.Objects, "X", 12, w.X + w.Width - 24, w.Y + 12, C.TEXT, 8)
     w.Draw.Sidebar = makeSquare(w.Objects, w.X + 8, w.Y + 48, 132, w.Height - 58, C.PANEL, true, 3)
@@ -421,17 +449,17 @@ local function layoutControl(c, x, y, w)
 
     if c.Type == "Label" then
         setPos(c.Draw.Text, x + 8, y + 6)
-        setText(c.Draw.Text, c.Value)
+        setText(c.Draw.Text, fitText(c.Value, w - 16, 13))
 
     elseif c.Type == "Info" then
         setPos(c.Draw.Box, x + 4, y + 2)
         setSize(c.Draw.Box, w - 8, c.Height - 4)
         setPos(c.Draw.Text, x + 10, y + 10)
-        setText(c.Draw.Text, c.Value)
+        setText(c.Draw.Text, fitText(c.Value, w - 20, 12))
 
     elseif c.Type == "Divider" then
         setPos(c.Draw.Text, x + 8, y + 5)
-        setText(c.Draw.Text, c.Value)
+        setText(c.Draw.Text, fitText(c.Value, w - 16, 12))
         setPos(c.Draw.Line, x + 8, y + 23)
         setSize(c.Draw.Line, w - 16, 1)
 
@@ -439,9 +467,11 @@ local function layoutControl(c, x, y, w)
         setPos(c.Draw.Box, x + 5, y + 3)
         setSize(c.Draw.Box, w - 10, c.Height - 6)
         setPos(c.Draw.Text, x + 12, y + 9)
+        setText(c.Draw.Text, fitText(c.Name, w - 24, 13))
 
     elseif c.Type == "Toggle" then
         setPos(c.Draw.Text, x + 8, y + 8)
+        setText(c.Draw.Text, fitText(c.Name, w - 62, 13))
         setPos(c.Draw.Track, x + w - 45, y + 8)
         setColor(c.Draw.Track, c.Value and C.RED_DARK or C.PANEL2)
         setPos(c.Draw.Knob, x + w - (c.Value and 26 or 42), y + 10)
@@ -452,6 +482,7 @@ local function layoutControl(c, x, y, w)
         local ratio = (tonumber(c.Value) - c.Min) / range
         if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
         setPos(c.Draw.Text, x + 8, y + 5)
+        setText(c.Draw.Text, fitText(c.Name, w - 108, 12))
         setPos(c.Draw.Value, x + w - 88, y + 5)
         setText(c.Draw.Value, string.format("%.3g%s", tonumber(c.Value) or 0, c.Suffix))
         setPos(c.Draw.Bar, x + 8, y + 31)
@@ -465,10 +496,11 @@ local function layoutControl(c, x, y, w)
             display = table.concat(c.Value, ", ")
         end
         setPos(c.Draw.Text, x + 8, y + 3)
+        setText(c.Draw.Text, fitText(c.Name, w - 16, 12))
         setPos(c.Draw.Box, x + 8, y + 18)
         setSize(c.Draw.Box, w - 16, 17)
         setPos(c.Draw.Value, x + 13, y + 20)
-        setText(c.Draw.Value, display)
+        setText(c.Draw.Value, fitText(display, w - 26, 12))
     end
 end
 
@@ -488,6 +520,7 @@ local function layoutSection(s, x, y, w)
     setPos(s.Draw.Border, x, y)
     setSize(s.Draw.Border, w, 1)
     setPos(s.Draw.Title, x + 9, y + 9)
+    setText(s.Draw.Title, fitText(s.Name, w - 18, 13))
 
     local cy = y + 29
     for _, c in ipairs(s.Controls) do
@@ -513,10 +546,9 @@ local function updateKeybind(c)
     local mode = string.lower(c.Keybind.Mode or "toggle")
 
     if mode == "hold" then
-        if c.Value ~= down then
-            c.Value = down
-            invoke(c.Callback, c.Value)
-        end
+        -- Holding the key is a temporary override only.
+        -- Never overwrite the toggle's stored ON/OFF state.
+        c.Keybind.Held = down
     elseif down and not c.LastKeyDown then
         c.Value = not c.Value
         invoke(c.Callback, c.Value)
@@ -607,6 +639,7 @@ local function updateWindow(w)
     setPos(w.Draw.RedLine, w.X, w.Y + 37)
     setSize(w.Draw.RedLine, w.Width, 1)
     setPos(w.Draw.Title, w.X + 12, w.Y + 12)
+    setText(w.Draw.Title, fitText(w.Title, math.max(100, w.Width - 330), 14))
     setPos(w.Draw.Version, w.X + math.max(220, w.Width - 270), w.Y + 13)
     setPos(w.Draw.Close, w.X + w.Width - 30, w.Y + 8)
     setPos(w.Draw.CloseText, w.X + w.Width - 24, w.Y + 12)
@@ -622,6 +655,7 @@ local function updateWindow(w)
         setSize(t.Draw.Button, 118, 30)
         setColor(t.Draw.Button, active and C.RED_DARK or C.PANEL2)
         setPos(t.Draw.Text, w.X + 25, ty + 8)
+        setText(t.Draw.Text, fitText(t.Name, 98, 13))
         setColor(t.Draw.Text, active and C.TEXT or C.MUTED)
 
         if pressed and pointIn(mx, my, w.X + 15, ty, 118, 30) then
@@ -700,6 +734,11 @@ RunService.RenderStepped:Connect(function()
     pcall(updateNotifications)
 end)
 
+local ENV = (getgenv and getgenv()) or _G
+ENV.INSui = Library
+_G.INSui = Library
 INSui = Library
+
 print("[INS Compat UI] Loaded " .. Library.Version)
+print("[INS Compat UI] Exported as INSui")
 return Library
